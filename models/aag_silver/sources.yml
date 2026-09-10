@@ -1,0 +1,29 @@
+version: 2
+
+sources:
+  - name: customer_info
+    database: "{{ var('catalog') }}"
+    schema: "{{ var('bronze_schema') }}"
+    tables:
+      - name: billing_accounts
+      - name: crm_customers
+      - name: ecommerce_users
+  - name: product_info
+    database: "{{ var('catalog') }}"
+    schema: "{{ var('bronze_schema') }}"
+    tables:
+      - name: pim_product_master
+      - name: pos_product_lookup
+      - name: erp_product_catalogue
+  - name: sales_info
+    database: "{{ var('catalog') }}"
+    schema: "{{ var('bronze_schema') }}"
+    tables:
+      - name: sales_transactions
+  - name: interactions_info
+    database: "{{ var('catalog') }}"
+    schema: "{{ var('bronze_schema') }}"
+    tables:
+      - name: whatsapp_interactions
+      - name: email_interactions
+      - name: customer_inquiries
