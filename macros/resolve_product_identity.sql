@@ -23,7 +23,15 @@
       CAST(NULL AS STRING) AS match_rule,
       CAST(NULL AS DOUBLE) AS match_confidence,
       CAST(false AS BOOLEAN) AS is_new_master
-    FROM {{ ref('stg_all_products') }}
+    FROM (
+      SELECT *,
+        ROW_NUMBER() OVER (
+          PARTITION BY source_system, source_code
+          ORDER BY source_updated_at DESC NULLS LAST
+        ) AS rn
+      FROM {{ ref('stg_all_products') }}
+    )
+    WHERE rn = 1
   {% endset %}
   {% do run_query(build_batch) %}
 
@@ -51,9 +59,7 @@
 
     -- Tier 2: fuzzy name match, for anything exact matching missed
     -- (e.g. minor punctuation/spacing differences)
-
-
-        {% set tier2 %}
+    {% set tier2 %}
       MERGE INTO {{ qualify }}.product_incoming_batch AS inc
       USING (
         WITH scored AS (
@@ -85,32 +91,42 @@
     {% endset %}
     {% do run_query(tier2) %}
 
+    -- Tier 3: no match -> new product master.
+    -- Same fix as customer resolution: uuid() can't sit directly in an
+    -- UPDATE/MERGE SET clause on Delta - generate via SELECT first.
+    {% set tier3_generate_ids %}
+      CREATE OR REPLACE TEMPORARY VIEW new_product_ids AS
+      SELECT
+        source_system, source_code,
+        concat('PROD-', replace(uuid(), '-', '')) AS new_master_id
+      FROM {{ qualify }}.product_incoming_batch
+      WHERE source_system = '{{ sys }}' AND resolved_master_id IS NULL
+    {% endset %}
+    {% do run_query(tier3_generate_ids) %}
 
+    {% set tier3_assign_ids %}
+      MERGE INTO {{ qualify }}.product_incoming_batch AS inc
+      USING new_product_ids AS nid
+      ON inc.source_system = nid.source_system AND inc.source_code = nid.source_code
+      WHEN MATCHED THEN UPDATE SET
+        inc.resolved_master_id = nid.new_master_id,
+        inc.is_new_master = true
+    {% endset %}
+    {% do run_query(tier3_assign_ids) %}
 
+    {% set tier3_insert %}
+      INSERT INTO {{ qualify }}.product_master (
+        master_product_id, product_name, product_name_norm, product_family,
+        list_price, match_confidence, created_at, updated_at
+      )
+      SELECT
+        resolved_master_id, product_name, product_name_norm, product_family,
+        price, 1.0, current_timestamp(), current_timestamp()
+      FROM {{ qualify }}.product_incoming_batch
+      WHERE source_system = '{{ sys }}' AND is_new_master = true
+    {% endset %}
+    {% do run_query(tier3_insert) %}
 
-        -- Tier 3: no match -> new product master.
-        -- Same fix as customer resolution: uuid() can't sit directly in an
-        -- UPDATE/MERGE SET clause on Delta - generate via SELECT first.
-        {% set tier3_generate_ids %}
-        CREATE OR REPLACE TEMPORARY VIEW new_product_ids AS
-        SELECT
-            source_system, source_code,
-            concat('PROD-', replace(uuid(), '-', '')) AS new_master_id
-        FROM {{ qualify }}.product_incoming_batch
-        WHERE source_system = '{{ sys }}' AND resolved_master_id IS NULL
-        {% endset %}
-        {% do run_query(tier3_generate_ids) %}
-
-        {% set tier3_assign_ids %}
-        MERGE INTO {{ qualify }}.product_incoming_batch AS inc
-        USING new_product_ids AS nid
-        ON inc.source_system = nid.source_system AND inc.source_code = nid.source_code
-        WHEN MATCHED THEN UPDATE SET
-            inc.resolved_master_id = nid.new_master_id,
-            inc.is_new_master = true
-        {% endset %}
-        {% do run_query(tier3_assign_ids) %}
-    
   {% endfor %}
 
   -- Crosswalk upsert
@@ -132,23 +148,56 @@
   {% endset %}
   {% do run_query(upsert_xref) %}
 
-  -- Survivorship: prefer PIM attributes, fall back to ERP then POS
+  -- Survivorship: prefer PIM attributes, fall back to ERP then POS.
+  -- Each source_system is deduped to at most one row per master_product_id
+  -- before joining - if fuzzy matching (Tier 2) ever links two genuinely
+  -- different products from the same source to one master (a real risk
+  -- with a lenient threshold), this keeps survivorship from crashing on
+  -- the resulting MERGE ambiguity. It doesn't fix the mis-match itself -
+  -- see the product_fuzzy_threshold note in dbt_project.yml.
   {% set survivorship %}
     MERGE INTO {{ qualify }}.product_master AS m
     USING (
+      WITH pim_dedup AS (
+        SELECT * FROM (
+          SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY resolved_master_id
+            ORDER BY source_updated_at DESC NULLS LAST
+          ) AS rn
+          FROM {{ qualify }}.product_incoming_batch
+          WHERE source_system = 'PIM' AND resolved_master_id IS NOT NULL
+        ) WHERE rn = 1
+      ),
+      erp_dedup AS (
+        SELECT * FROM (
+          SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY resolved_master_id
+            ORDER BY source_updated_at DESC NULLS LAST
+          ) AS rn
+          FROM {{ qualify }}.product_incoming_batch
+          WHERE source_system = 'ERP' AND resolved_master_id IS NOT NULL
+        ) WHERE rn = 1
+      ),
+      pos_dedup AS (
+        SELECT * FROM (
+          SELECT *, ROW_NUMBER() OVER (
+            PARTITION BY resolved_master_id
+            ORDER BY source_updated_at DESC NULLS LAST
+          ) AS rn
+          FROM {{ qualify }}.product_incoming_batch
+          WHERE source_system = 'POS' AND resolved_master_id IS NOT NULL
+        ) WHERE rn = 1
+      )
       SELECT
         x.master_product_id,
         COALESCE(pim.product_name, erp.product_name, pos.product_name) AS product_name,
         COALESCE(pim.product_name_norm, erp.product_name_norm, pos.product_name_norm) AS product_name_norm,
         COALESCE(pim.product_family, erp.product_family, pos.product_family) AS product_family,
         COALESCE(pim.price, erp.price, pos.price) AS list_price
-      FROM (SELECT DISTINCT resolved_master_id AS master_product_id FROM {{ qualify }}.product_incoming_batch) x
-      LEFT JOIN {{ qualify }}.product_incoming_batch pim
-        ON pim.resolved_master_id = x.master_product_id AND pim.source_system = 'PIM'
-      LEFT JOIN {{ qualify }}.product_incoming_batch erp
-        ON erp.resolved_master_id = x.master_product_id AND erp.source_system = 'ERP'
-      LEFT JOIN {{ qualify }}.product_incoming_batch pos
-        ON pos.resolved_master_id = x.master_product_id AND pos.source_system = 'POS'
+      FROM (SELECT DISTINCT resolved_master_id AS master_product_id FROM {{ qualify }}.product_incoming_batch WHERE resolved_master_id IS NOT NULL) x
+      LEFT JOIN pim_dedup pim ON pim.resolved_master_id = x.master_product_id
+      LEFT JOIN erp_dedup erp ON erp.resolved_master_id = x.master_product_id
+      LEFT JOIN pos_dedup pos ON pos.resolved_master_id = x.master_product_id
     ) AS s
     ON m.master_product_id = s.master_product_id
     WHEN MATCHED THEN UPDATE SET

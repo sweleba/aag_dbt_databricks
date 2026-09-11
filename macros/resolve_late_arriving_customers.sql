@@ -19,7 +19,7 @@
   {% set bronze = var('bronze_schema') %}
   {% set qualify = catalog ~ "." ~ schema %}
 
-  {% set fact_identities %}
+    {% set fact_identities %}
     CREATE OR REPLACE TEMPORARY VIEW fact_identities_unmatched AS
     WITH fact_ids AS (
       SELECT
@@ -45,10 +45,22 @@
         {{ normalize_msisdn('customer_msisdn') }}
       FROM {{ source('interactions_info', 'whatsapp_interactions') }}
     ),
-    distinct_ids AS (
-      SELECT DISTINCT email_norm, msisdn_e164
+    grouped_by_email AS (
+      SELECT email_norm, MAX(msisdn_e164) AS msisdn_e164
       FROM fact_ids
-      WHERE email_norm IS NOT NULL OR msisdn_e164 IS NOT NULL
+      WHERE email_norm IS NOT NULL
+      GROUP BY email_norm
+    ),
+    phone_only AS (
+      SELECT CAST(NULL AS STRING) AS email_norm, msisdn_e164
+      FROM fact_ids
+      WHERE email_norm IS NULL AND msisdn_e164 IS NOT NULL
+      GROUP BY msisdn_e164
+    ),
+    distinct_ids AS (
+      SELECT * FROM grouped_by_email
+      UNION ALL
+      SELECT * FROM phone_only
     )
     SELECT d.email_norm, d.msisdn_e164
     FROM distinct_ids d
