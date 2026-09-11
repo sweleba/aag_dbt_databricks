@@ -379,6 +379,7 @@
       m.outstanding_balance = COALESCE(s.outstanding_balance, m.outstanding_balance),
       m.currency = COALESCE(s.currency, m.currency),
       m.marketing_opt_in = COALESCE(s.marketing_opt_in, m.marketing_opt_in),
+      m.is_inferred = false,
       m.updated_at = current_timestamp()
   {% endset %}
   {% do run_query(survivorship) %}
